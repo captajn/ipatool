@@ -27,49 +27,35 @@ This document tracks the security posture of the bot against the OWASP Top 10 + 
 | 19 | **Race Condition** | ✅ Pass | `pkg/ipatool` dùng `sync.Map` of `*sync.Mutex` per-user — chỉ 1 lệnh ipatool / user / thời điểm (chống corrupt keychain khi spam). Crypto cipher safe-for-concurrent-use. |
 | 20 | **Outdated Dependency** | ✅ Pass | Quét bằng `govulncheck` — **0 vulns trong code**, 1 vuln trong dep nhưng code không call (transitive). Recommend chạy `govulncheck` định kỳ. |
 
-## ❓ FAQ — câu hỏi audit phổ biến
+## 🏗️ Architecture
 
-### "Patch chỉ ~56 dòng mà sao bảo nhiều tính năng thế?"
-
-**Tính năng KHÔNG ở patch — ở bot Go code (~3000 dòng).** Patch ipatool chỉ làm 5 việc tối thiểu để CLI gốc chạy được headless:
-
-| Patch | Vai trò | Liên quan tính năng nào? |
-|-------|---------|--------------------------|
-| FileBackend only | Bỏ phụ thuộc GUI keychain | Chạy được trên Linux server không có DBus |
-| Fix `.(bool)` panic | Bug upstream | Login với `--non-interactive` không crash |
-| Retry + fail-fast | Reliability | Khi Apple trả non-plist transient |
-| Debug raw body | Observability | Khi plist parse fail biết Apple trả gì |
-
-Multi-account, encryption, rate limit, group support, progress bar, `/login`, `/get`, multi-region lookup, MTProto upload — **toàn bộ ở bot code (Go)**, không ở patch ipatool.
-
-### "Vậy bot truyền tham số tải vào ipatool kiểu gì nếu không patch?"
-
-Bot **dùng nguyên CLI flags chuẩn của ipatool gốc** — exec subprocess y như user gõ tay:
-
-```bash
-ipatool --keychain-passphrase ... --non-interactive auth login -e <email> -p <pass> --auth-code <code>
-ipatool --keychain-passphrase ... --non-interactive download -i <appID> -o <out> --purchase
-ipatool --keychain-passphrase ... --non-interactive purchase -b <bundleID>
-ipatool --keychain-passphrase ... --non-interactive auth info
+```
+Telegram user
+    │ message / button / command
+    ▼
+┌────────────────────────────────────────────┐
+│ Telegram Bot API                           │ ← BotToken auth
+│ (long polling)                             │
+└────────────────────────────────────────────┘
+    │
+    ▼
+┌────────────────────────────────────────────┐
+│ Bot Go process (~3000 lines)               │
+│  • Multi-account / encryption / rate limit │
+│  • Per-user mutex                          │
+│  • Per-user keychain dir                   │
+└────────────────────────────────────────────┘
+    │ exec subprocess               │ MTProto upload (file > 50MB)
+    ▼                               ▼
+ipatool CLI (patched)           api.telegram.org
+    │
+    ▼
+*.apple.com  (auth, search, download)
 ```
 
-Xem `pkg/ipatool/ipatool.go` — bot chỉ build `exec.Command("ipatool", args...)` rồi capture stdout/stderr. **Patch KHÔNG đụng vào CLI args / flags / commands**, chỉ thay backend storage và sửa lỗi runtime.
+Bot dùng `exec.Command("ipatool", args...)` với CLI flags chuẩn upstream (`auth login -e ... -p ... --auth-code ...`). Patch chỉ thay storage backend (FileBackend) + fix bugs + retry — **không thay đổi flags hay logic command**.
 
-### "Dự án có HTML chỗ nào?"
-
-Có 2 chỗ duy nhất, đều không phải full web app:
-
-1. **Telegram messages với `parse_mode=HTML`** — bot gửi text formatted (`<b>`, `<code>`, `<a>`) qua Bot API. Telegram client (mobile/desktop) render. Không phải browser.
-2. **`/i/<file>` 404 page** — 1 trang HTML tĩnh báo "link hết hạn" — không nhận user input.
-
-KHÔNG có:
-- Web frontend / SPA
-- Template engine
-- Cookie / session
-- AJAX / fetch endpoints
-- WebSocket
-
-Phần "XSS protection" trong audit chủ yếu phòng case khi attacker đặt First Name là `<b>fake</b>` rồi admin xem trong `/check` — nó sẽ break format nhưng KHÔNG có XSS như nghĩa cổ điển vì không có browser execute JS.
+Tin nhắn Telegram dùng `parse_mode=HTML` (bot client render, không phải browser). Web server `/i/<file>` chỉ là 1 endpoint serve file IPA cho iPhone Safari cài — không có frontend, không có session, không có form.
 
 ---
 
