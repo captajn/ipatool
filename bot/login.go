@@ -98,7 +98,11 @@ func (b *Bot) handleLoginCommand(msg *tgbotapi.Message) {
 func (b *Bot) startLogin(chatID int64) {
 	ctx := context.Background()
 	b.IPATool.ResetSession(chatID)
-	b.DB.UpdateUser(ctx, chatID, bson.M{"$set": bson.M{"loginStep": "awaiting_apple_id"}})
+	// Set loginStep + lastUsed cùng lúc — cleanup goroutine dùng lastUsed để biết user còn active.
+	b.DB.UpdateUser(ctx, chatID, bson.M{"$set": bson.M{
+		"loginStep": "awaiting_apple_id",
+		"lastUsed":  time.Now().UnixMilli(),
+	}})
 	msg := tgbotapi.NewMessage(chatID, "Vui lòng nhập Apple ID: 📧")
 	msg.ParseMode = "HTML"
 	sent, _ := b.SafeSend(msg)

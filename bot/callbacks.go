@@ -1,15 +1,23 @@
 package bot
 
 import (
+	"context"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 func (b *Bot) HandleCallback(query *tgbotapi.CallbackQuery) {
 	chatID := query.Message.Chat.ID
 	msgID := query.Message.MessageID
+
+	// IMPORTANT: Update lastUsed để cleanup goroutine không nhầm xóa session.
+	// Click button cũng tính là "active" — nếu không update, user idle 5+ phút,
+	// rồi click "Login" → loginStep set nhưng lastUsed vẫn cũ → bị xoá ngay.
+	b.DB.UpdateUser(context.Background(), chatID, bson.M{"$set": bson.M{"lastUsed": time.Now().UnixMilli()}})
 
 	switch query.Data {
 	case "login":
