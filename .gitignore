@@ -1,0 +1,47 @@
+# Secrets — NEVER commit
+.env
+.env.local
+
+# Runtime data
+tmp/
+public/
+
+# Build artifacts
+ipa-downloader-bot
+ipa-downloader-bot.exe
+ipatool
+ipatool.exe
+ipatool-*.exe
+ipatool-linux-amd64
+ipatool-windows-amd64
+*.tar.gz
+*.zip
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+mock.log
+
+# Dependencies (Go)
+vendor/
+
+# Test artifacts
+coverage.out
+*.test
+
+# Misc
+codebase.html
+plan.md
+*.exe~
+majd-ipatool-*.txt
+src/
+
+# OS / Editor backup
+*~
+*.bak
