@@ -135,22 +135,22 @@ openssl rand -base64 32
 
 #### 3. Build patched ipatool
 
+Bot dùng [`majd/ipatool`](https://github.com/majd/ipatool) đã patch (FileBackend only + fix bug). Script tự động clone + apply patches + build:
+
 ```bash
-# Clone source ipatool gốc
-git clone https://github.com/majd/ipatool.git majd-ipatool-src
-cd majd-ipatool-src
+# Build cho OS hiện tại
+./scripts/build-ipatool.sh
 
-# Patch để dùng FileBackend only + fix interactiveKey
-# (Xem patches trong PATCHES.md hoặc copy từ /e/Code/majd-ipatool-src/)
-
-# Build
-GOOS=linux GOARCH=amd64 go build -o ../ipatool .          # Linux
-GOOS=windows GOARCH=amd64 go build -o ../ipatool.exe .    # Windows
+# Cross-compile (tuỳ chọn)
+./scripts/build-ipatool.sh linux amd64
+./scripts/build-ipatool.sh windows amd64
 
 # Đặt vào PATH
-sudo mv ../ipatool /usr/local/bin/                        # Linux
-# hoặc copy ipatool.exe vào %PATH% trên Windows
+sudo mv ipatool /usr/local/bin/                  # Linux/macOS
+# hoặc copy ipatool.exe vào %PATH% (Windows)
 ```
+
+Chi tiết các patches: xem [PATCHES.md](./PATCHES.md). Patch file ở [`scripts/ipatool.patch`](./scripts/ipatool.patch).
 
 #### 4. Chạy bot
 
@@ -349,22 +349,22 @@ openssl rand -base64 32
 
 #### 3. Build patched ipatool
 
+The bot uses a patched [`majd/ipatool`](https://github.com/majd/ipatool) (FileBackend only + bug fixes). The script auto-clones, applies patches, and builds:
+
 ```bash
-# Clone original ipatool source
-git clone https://github.com/majd/ipatool.git majd-ipatool-src
-cd majd-ipatool-src
+# Build for current OS
+./scripts/build-ipatool.sh
 
-# Apply patches: FileBackend only + fix interactiveKey
-# (See PATCHES.md or copy from /e/Code/majd-ipatool-src/)
+# Cross-compile (optional)
+./scripts/build-ipatool.sh linux amd64
+./scripts/build-ipatool.sh windows amd64
 
-# Build
-GOOS=linux GOARCH=amd64 go build -o ../ipatool .          # Linux
-GOOS=windows GOARCH=amd64 go build -o ../ipatool.exe .    # Windows
-
-# Place into PATH
-sudo mv ../ipatool /usr/local/bin/                        # Linux
-# or copy ipatool.exe to %PATH% on Windows
+# Install to PATH
+sudo mv ipatool /usr/local/bin/                  # Linux/macOS
+# or copy ipatool.exe to %PATH% (Windows)
 ```
+
+For patch details, see [PATCHES.md](./PATCHES.md). Patch file is at [`scripts/ipatool.patch`](./scripts/ipatool.patch).
 
 #### 4. Run
 

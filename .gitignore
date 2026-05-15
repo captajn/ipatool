@@ -42,6 +42,9 @@ plan.md
 majd-ipatool-*.txt
 src/
 
+# Patched ipatool source (auto-cloned by build script)
+.ipatool-build/
+
 # OS / Editor backup
 *~
 *.bak

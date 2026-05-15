@@ -1,0 +1,159 @@
+diff --git a/cmd/auth.go b/cmd/auth.go
+index 34e1d4a..0adf2e7 100644
+--- a/cmd/auth.go
++++ b/cmd/auth.go
+@@ -47,7 +47,7 @@ func loginCmd() *cobra.Command {
+ 		Use:   "login",
+ 		Short: "Login to the App Store",
+ 		RunE: func(cmd *cobra.Command, args []string) error {
+-			interactive := cmd.Context().Value("interactive").(bool)
++			interactive, _ := cmd.Context().Value(interactiveKey).(bool)
+ 
+ 			if password == "" && !interactive {
+ 				return errors.New("password is required when not running in interactive mode; use the \"--password\" flag")
+diff --git a/cmd/common.go b/cmd/common.go
+index 3b3a3de..ce411f3 100644
+--- a/cmd/common.go
++++ b/cmd/common.go
+@@ -60,11 +60,12 @@ func newCookieJar(machine machine.Machine) http.CookieJar {
+ }
+ 
+ // newKeychain returns a new keychain instance.
++// Only FileBackend is allowed so ipatool can run headless (no GUI, no DBus)
++// in any environment. Credentials are stored as an encrypted file under
++// $HOME/.ipatool/ and unlocked with --keychain-passphrase.
+ func newKeychain(machine machine.Machine, logger log.Logger, interactive bool) keychain.Keychain {
+ 	ring := util.Must(keyring.Open(keyring.Config{
+ 		AllowedBackends: []keyring.BackendType{
+-			keyring.KeychainBackend,
+-			keyring.SecretServiceBackend,
+ 			keyring.FileBackend,
+ 		},
+ 		ServiceName: KeychainServiceName,
+diff --git a/cmd/download.go b/cmd/download.go
+index 0df1d36..30d7693 100644
+--- a/cmd/download.go
++++ b/cmd/download.go
+@@ -81,7 +81,7 @@ func downloadCmd() *cobra.Command {
+ 						Msg("purchase")
+ 				}
+ 
+-				interactive, _ := cmd.Context().Value("interactive").(bool)
++				interactive, _ := cmd.Context().Value(interactiveKey).(bool)
+ 				var progress *progressbar.ProgressBar
+ 				if interactive {
+ 					progress = progressbar.NewOptions64(1,
+diff --git a/pkg/appstore/appstore_bag.go b/pkg/appstore/appstore_bag.go
+index 29108a2..8957c7a 100644
+--- a/pkg/appstore/appstore_bag.go
++++ b/pkg/appstore/appstore_bag.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	gohttp "net/http"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/majd/ipatool/v2/pkg/http"
+ )
+@@ -23,18 +24,36 @@ func (t *appstore) Bag(input BagInput) (BagOutput, error) {
+ 	guid := strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
+ 	req := t.bagRequest(guid)
+ 
+-	res, err := t.bagClient.Send(req)
+-	if err != nil {
+-		return BagOutput{}, fmt.Errorf("failed to send http request: %w", err)
+-	}
++	// Retry up to 3 times — Apple occasionally returns non-plist responses
++	// (HTML error pages, empty bodies, etc.) on transient failures.
++	var lastErr error
++	for attempt := 0; attempt < 3; attempt++ {
++		if attempt > 0 {
++			time.Sleep(time.Duration(attempt) * 2 * time.Second)
++		}
++
++		res, err := t.bagClient.Send(req)
++		if err != nil {
++			lastErr = fmt.Errorf("attempt %d: %w", attempt+1, err)
++			continue
++		}
++
++		if res.StatusCode != gohttp.StatusOK {
++			lastErr = fmt.Errorf("attempt %d: received unexpected status code: %d", attempt+1, res.StatusCode)
++			continue
++		}
++
++		if res.Data.URLBag.AuthEndpoint == "" {
++			lastErr = fmt.Errorf("attempt %d: bag response missing auth endpoint", attempt+1)
++			continue
++		}
+ 
+-	if res.StatusCode != gohttp.StatusOK {
+-		return BagOutput{}, fmt.Errorf("received unexpected status code: %d", res.StatusCode)
++		return BagOutput{
++			AuthEndpoint: res.Data.URLBag.AuthEndpoint,
++		}, nil
+ 	}
+ 
+-	return BagOutput{
+-		AuthEndpoint: res.Data.URLBag.AuthEndpoint,
+-	}, nil
++	return BagOutput{}, fmt.Errorf("failed to fetch bag after 3 attempts: %w", lastErr)
+ }
+ 
+ type bagResult struct {
+diff --git a/pkg/appstore/appstore_login.go b/pkg/appstore/appstore_login.go
+index 419fdea..cafa943 100644
+--- a/pkg/appstore/appstore_login.go
++++ b/pkg/appstore/appstore_login.go
+@@ -7,6 +7,7 @@ import (
+ 	gohttp "net/http"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/majd/ipatool/v2/pkg/http"
+ 	"github.com/majd/ipatool/v2/pkg/util"
+@@ -76,10 +77,22 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string) (Acco
+ 	for attempt := 1; retry && attempt <= 4; attempt++ {
+ 		request := t.loginRequest(email, password, authCode, guid, endpoint, attempt)
+ 		request.URL, _ = util.IfEmpty(redirect, request.URL), ""
+-		res, err = t.loginClient.Send(request)
+ 
+-		if err != nil {
+-			return Account{}, fmt.Errorf("request failed: %w", err)
++		// Retry transient parse errors (Apple sometimes returns HTML instead of plist)
++		var sendErr error
++		for sendTry := 0; sendTry < 3; sendTry++ {
++			res, sendErr = t.loginClient.Send(request)
++			if sendErr == nil {
++				break
++			}
++			if strings.Contains(sendErr.Error(), "unmarshal") || strings.Contains(sendErr.Error(), "plist") {
++				time.Sleep(time.Duration(sendTry+1) * 2 * time.Second)
++				continue
++			}
++			break // non-transient error, don't retry
++		}
++		if sendErr != nil {
++			return Account{}, fmt.Errorf("request failed: %w", sendErr)
+ 		}
+ 
+ 		if retry, redirect, err = t.parseLoginResponse(&res, attempt, authCode); err != nil {
+diff --git a/pkg/http/client.go b/pkg/http/client.go
+index 496d02c..116dd66 100644
+--- a/pkg/http/client.go
++++ b/pkg/http/client.go
+@@ -166,7 +166,12 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
+ 
+ 	_, err = plist.Unmarshal(normalizedBody, &data)
+ 	if err != nil {
+-		return Result[R]{}, fmt.Errorf("failed to unmarshal xml: %w", err)
++		// Log raw body for debugging plist parse failures
++		snippet := string(body)
++		if len(snippet) > 500 {
++			snippet = snippet[:500] + "...(truncated)"
++		}
++		return Result[R]{}, fmt.Errorf("failed to unmarshal xml: %w\nraw_body_preview: %s", err, snippet)
+ 	}
+ 
+ 	headers := map[string]string{}
