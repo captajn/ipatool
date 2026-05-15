@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -23,13 +25,128 @@ type Server struct {
 	httpServer *http.Server
 }
 
+// ipRateLimiter: per-IP token bucket đơn giản, chống DDoS / spam download.
+// Mỗi IP: maxReq request / window thời gian. Mặc định 60/phút (đủ cho cài app
+// bình thường, chặn bot/scraper).
+type ipRateLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*ipBucket
+	maxReq  int
+	window  time.Duration
+}
+
+type ipBucket struct {
+	count int
+	reset time.Time
+}
+
+func newIPRateLimiter(maxReq int, window time.Duration) *ipRateLimiter {
+	rl := &ipRateLimiter{
+		buckets: make(map[string]*ipBucket),
+		maxReq:  maxReq,
+		window:  window,
+	}
+	// Cleanup goroutine: xóa bucket hết hạn mỗi 5 phút, tránh memory leak
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			rl.cleanup()
+		}
+	}()
+	return rl
+}
+
+func (rl *ipRateLimiter) allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	b, ok := rl.buckets[ip]
+	if !ok || now.After(b.reset) {
+		rl.buckets[ip] = &ipBucket{count: 1, reset: now.Add(rl.window)}
+		return true
+	}
+	if b.count >= rl.maxReq {
+		return false
+	}
+	b.count++
+	return true
+}
+
+func (rl *ipRateLimiter) cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	for ip, b := range rl.buckets {
+		if now.After(b.reset) {
+			delete(rl.buckets, ip)
+		}
+	}
+}
+
+// clientIP lấy IP thật của client. Ưu tiên X-Forwarded-For / X-Real-IP nếu có
+// (khi chạy sau reverse proxy nginx/cloudflare).
+func clientIP(c *gin.Context) string {
+	if ip := c.GetHeader("X-Real-IP"); ip != "" {
+		return ip
+	}
+	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
+		if idx := strings.Index(xff, ","); idx > 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+	if err != nil {
+		return c.Request.RemoteAddr
+	}
+	return host
+}
+
+// securityHeaders gắn HTTP headers chống XSS / clickjacking / sniffing.
+func securityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		// CSP rất chặt: không inline JS, không external resource
+		c.Header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
+		c.Next()
+	}
+}
+
+// rateLimitMiddleware reject request nếu IP vượt quá quota.
+func rateLimitMiddleware(rl *ipRateLimiter) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := clientIP(c)
+		if !rl.allow(ip) {
+			c.Header("Retry-After", "60")
+			c.String(http.StatusTooManyRequests, "Too many requests. Try again later.")
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
 func Start(port string, publicDir string, hostURL string) *Server {
 	r := gin.Default()
 
-	// Ensure public directory exists
+	// Apply security middleware GLOBALLY
+	r.Use(securityHeaders())
+
+	// Rate limit: 60 request / phút / IP cho download endpoints.
+	// Cài 1 app IPA ~10-20 file requests (parsing manifest + download IPA + icon...)
+	// → 60/phút đủ rộng cho user thật, chặn bot.
+	rl := newIPRateLimiter(60, time.Minute)
+	r.Use(rateLimitMiddleware(rl))
+
+	// Public directory
 	absPublicDir, _ := filepath.Abs(publicDir)
 	os.MkdirAll(absPublicDir, 0755)
-	
+
+	// Static file serving (Gin built-in, đã safe khỏi path traversal)
 	r.StaticFS("/public", http.Dir(absPublicDir))
 
 	// Redirect handler for /i/:filename
@@ -42,7 +159,7 @@ func Start(port string, publicDir string, hostURL string) *Server {
 			return
 		}
 
-		// Double-check: path resolved phải nằm trong absPublicDir
+		// Double-check: resolved path phải nằm trong absPublicDir
 		filePath := filepath.Join(absPublicDir, filename)
 		cleanPath, err := filepath.Abs(filePath)
 		if err != nil || !strings.HasPrefix(cleanPath, absPublicDir+string(filepath.Separator)) {
@@ -52,8 +169,7 @@ func Start(port string, publicDir string, hostURL string) *Server {
 
 		if _, err := os.Stat(filePath); os.IsNotExist(err) {
 			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.String(http.StatusNotFound, `
-<!DOCTYPE html>
+			c.String(http.StatusNotFound, `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -80,13 +196,18 @@ func Start(port string, publicDir string, hostURL string) *Server {
 
 		directURL := fmt.Sprintf("%s/public/%s", hostURL, filename)
 		installURL := fmt.Sprintf("https://dl.thuthuatjb.com/ipa/install.html?url=%s", url.QueryEscape(directURL))
-		
+
 		c.Redirect(http.StatusFound, installURL)
 	})
 
 	srv := &http.Server{
 		Addr:    ":" + port,
 		Handler: r,
+		// Timeouts chống slow-loris attack
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      5 * time.Minute, // upload IPA có thể chậm
+		IdleTimeout:       30 * time.Second,
 	}
 
 	log.Printf("🌍 Web Server starting on port %s", port)

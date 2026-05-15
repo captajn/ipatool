@@ -8,7 +8,7 @@ This document tracks the security posture of the bot against the OWASP Top 10 + 
 |---|---------------|--------|------------|
 | 1 | **Hardcoded Secrets** | ✅ Pass | Tất cả secret đến từ env vars (`.env`). `.gitignore` chặn `.env`. README dặn rõ. |
 | 2 | **SQL/NoSQL Injection** | ✅ Pass | Mongo driver dùng `bson.M{}` parameterized values, không string concat. Keys hardcoded. |
-| 3 | **XSS / HTML Injection** | ✅ Pass | Tất cả user-controlled string đi qua `html.EscapeString()` trước khi inject vào HTML message. Bao gồm `FirstName`, `AppleID`, `appName`. |
+| 3 | **HTML Injection trong Telegram message** | ✅ Pass | Bot gửi tin nhắn `parse_mode=HTML`. User-controlled string (`FirstName`, `AppleID`, `appName`) đi qua `html.EscapeString()` trước khi inject. Note: KHÔNG có web frontend, KHÔNG có browser → đây không phải XSS truyền thống, chỉ format break / clickbait phòng ngừa. |
 | 4 | **IDOR** | ✅ Pass | `chatID` luôn lấy từ Telegram message metadata (`msg.Chat.ID`), không từ user input. Telegram đảm bảo identity. |
 | 5 | **Slopsquatting** | ✅ Pass | Tất cả deps trong `go.mod` từ orgs uy tín: `gin-gonic`, `gotd`, `mongo-driver`, `google`, `joho`, `nfnt`. Không có package lạ/typo. |
 | 6 | **Brute Force** | ✅ Pass | `pkg/ratelimit`: per-user token bucket. `/login` giới hạn **5 attempts / 10 phút**. Login OK → reset bucket. |
@@ -23,9 +23,55 @@ This document tracks the security posture of the bot against the OWASP Top 10 + 
 | 15 | **CORS Misconfiguration** | ✅ Pass | Web server (Gin) default không expose CORS headers. `/i/<file>` chỉ redirect, `/public/<file>` static — không cần CORS. |
 | 16 | **Unrestricted File Upload** | ✅ Pass | Bot **không nhận upload từ user**. Chỉ tải IPA từ Apple servers (`*.apple.com`). Filename validate khi serve qua web. |
 | 17 | **Verbose Error Messages** | ✅ Pass | Error category-hoá qua `Categorize()` → user-friendly message. Stack traces chỉ vào stdout server, không gửi ra Telegram. Raw `err.Error()` bị truncate khi escape. |
-| 18 | **Missing Rate Limit** | ✅ Pass | `/login`: 5 / 10min. Download/actions: 30 / phút. Plus `CooldownDuration` per-user cho download (mặc định 15 phút). |
+| 18 | **Missing Rate Limit** | ✅ Pass | **Bot side:** `/login` 5/10min, action 30/phút, cooldown 15 phút per-user. **Web side:** 60 req/phút per-IP cho `/i/<file>` + `/public/<file>` (chống DDoS / scraper).  |
 | 19 | **Race Condition** | ✅ Pass | `pkg/ipatool` dùng `sync.Map` of `*sync.Mutex` per-user — chỉ 1 lệnh ipatool / user / thời điểm (chống corrupt keychain khi spam). Crypto cipher safe-for-concurrent-use. |
 | 20 | **Outdated Dependency** | ✅ Pass | Quét bằng `govulncheck` — **0 vulns trong code**, 1 vuln trong dep nhưng code không call (transitive). Recommend chạy `govulncheck` định kỳ. |
+
+## ❓ FAQ — câu hỏi audit phổ biến
+
+### "Patch chỉ ~56 dòng mà sao bảo nhiều tính năng thế?"
+
+**Tính năng KHÔNG ở patch — ở bot Go code (~3000 dòng).** Patch ipatool chỉ làm 5 việc tối thiểu để CLI gốc chạy được headless:
+
+| Patch | Vai trò | Liên quan tính năng nào? |
+|-------|---------|--------------------------|
+| FileBackend only | Bỏ phụ thuộc GUI keychain | Chạy được trên Linux server không có DBus |
+| Fix `.(bool)` panic | Bug upstream | Login với `--non-interactive` không crash |
+| Retry + fail-fast | Reliability | Khi Apple trả non-plist transient |
+| Debug raw body | Observability | Khi plist parse fail biết Apple trả gì |
+
+Multi-account, encryption, rate limit, group support, progress bar, `/login`, `/get`, multi-region lookup, MTProto upload — **toàn bộ ở bot code (Go)**, không ở patch ipatool.
+
+### "Vậy bot truyền tham số tải vào ipatool kiểu gì nếu không patch?"
+
+Bot **dùng nguyên CLI flags chuẩn của ipatool gốc** — exec subprocess y như user gõ tay:
+
+```bash
+ipatool --keychain-passphrase ... --non-interactive auth login -e <email> -p <pass> --auth-code <code>
+ipatool --keychain-passphrase ... --non-interactive download -i <appID> -o <out> --purchase
+ipatool --keychain-passphrase ... --non-interactive purchase -b <bundleID>
+ipatool --keychain-passphrase ... --non-interactive auth info
+```
+
+Xem `pkg/ipatool/ipatool.go` — bot chỉ build `exec.Command("ipatool", args...)` rồi capture stdout/stderr. **Patch KHÔNG đụng vào CLI args / flags / commands**, chỉ thay backend storage và sửa lỗi runtime.
+
+### "Dự án có HTML chỗ nào?"
+
+Có 2 chỗ duy nhất, đều không phải full web app:
+
+1. **Telegram messages với `parse_mode=HTML`** — bot gửi text formatted (`<b>`, `<code>`, `<a>`) qua Bot API. Telegram client (mobile/desktop) render. Không phải browser.
+2. **`/i/<file>` 404 page** — 1 trang HTML tĩnh báo "link hết hạn" — không nhận user input.
+
+KHÔNG có:
+- Web frontend / SPA
+- Template engine
+- Cookie / session
+- AJAX / fetch endpoints
+- WebSocket
+
+Phần "XSS protection" trong audit chủ yếu phòng case khi attacker đặt First Name là `<b>fake</b>` rồi admin xem trong `/check` — nó sẽ break format nhưng KHÔNG có XSS như nghĩa cổ điển vì không có browser execute JS.
+
+---
 
 ## 🛡️ Privacy guarantees
 
@@ -46,6 +92,20 @@ This document tracks the security posture of the bot against the OWASP Top 10 + 
 - ❌ Mã 2FA dưới bất kỳ hình thức nào
 - ❌ Nội dung của file IPA
 - ❌ Log với password / 2FA code (đã mask `-p`, `--password`, `--auth-code` trong `pkg/ipatool/runCommand`)
+
+### 🌐 Web server (`/i/<file>` + `/public/<file>`)
+
+API ra ngoài duy nhất là HTTP server cho phép user cài IPA qua iPhone Safari. Bảo vệ:
+
+| Layer | Cơ chế |
+|-------|--------|
+| **Path traversal** | Regex `^[a-zA-Z0-9._-]+$` + `filepath.Abs()` prefix check → chặn `../etc/passwd` |
+| **Rate limit per-IP** | 60 req/phút/IP, trả `429 Too Many Requests` + `Retry-After: 60` |
+| **Security headers** | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Strict-Transport-Security`, strict `Content-Security-Policy` |
+| **Slow-loris timeout** | `ReadTimeout: 15s`, `ReadHeaderTimeout: 5s`, `IdleTimeout: 30s` |
+| **Auto cleanup** | File trong `public/` xóa sau 1h (cleanupStalePublicFiles) |
+| **UUID filename** | Filename là `<uuid>_<safe-name>` (36 ký tự random) → không guess được |
+| **Reverse proxy aware** | Lấy IP thật từ `X-Real-IP` / `X-Forwarded-For` khi sau nginx/cloudflare |
 
 ### Network egress
 

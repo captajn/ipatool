@@ -1,75 +1,63 @@
 # 🩹 Patches applied to `majd/ipatool`
 
-Bot dùng [`majd/ipatool`](https://github.com/majd/ipatool) làm engine. Để chạy được dưới dạng Telegram bot trên server (headless, multi-user), source ipatool gốc cần một số patch nhỏ.
+Bot dùng [`majd/ipatool@v2.3.0`](https://github.com/majd/ipatool/releases/tag/v2.3.0) làm engine. Để chạy được headless trên server, source gốc cần 5 thay đổi nhỏ — **tổng cộng ~56 dòng code thay đổi** (151 dòng patch bao gồm context lines).
 
-This bot uses [`majd/ipatool`](https://github.com/majd/ipatool) as its engine. To run as a headless multi-user Telegram bot, the upstream source needs a few small patches.
+This bot uses [`majd/ipatool@v2.3.0`](https://github.com/majd/ipatool/releases/tag/v2.3.0) as engine. To run headless on a server, the source needs 5 small changes — **~56 lines of actual code changes** (patch is 151 lines including diff context).
 
 ---
 
-## ⚡ Quick build (auto-apply patches)
+## ⚡ Auto-build
 
 ```bash
-# Build cho OS hiện tại (output: ./ipatool[.exe])
-./scripts/build-ipatool.sh
-
-# Cross-compile
-./scripts/build-ipatool.sh linux amd64
-./scripts/build-ipatool.sh windows amd64
-./scripts/build-ipatool.sh darwin amd64
+./scripts/build-ipatool.sh                    # current OS
+./scripts/build-ipatool.sh linux amd64        # cross-compile
 ```
 
-Script sẽ:
-1. Clone `majd/ipatool@v2.3.0` vào `.ipatool-build/`
-2. Apply `scripts/ipatool.patch` (tất cả patches dưới đây)
-3. Build binary
-
-Sau đó copy binary vào `$PATH` để bot tìm thấy.
+Script clones v2.3.0 → applies patch → builds binary. Hết.
 
 ---
 
-## 📋 Danh sách patches
+## 📋 5 thay đổi (5 changes)
 
-File `scripts/ipatool.patch` chứa 6 thay đổi sau:
+### 1. `cmd/common.go` — FileBackend only *(3 dòng)*
 
-### 1. `cmd/common.go` — FileBackend only
+Bỏ `KeychainBackend` (macOS) + `SecretServiceBackend` (Linux DBus). Giữ `FileBackend` (encrypted file unlocked qua passphrase).
 
-**Why:** Bot chạy headless, không có GUI để mở Keychain/WinCred/SecretService. Bắt buộc dùng `FileBackend` (file `.ipatool/keychain` mã hoá bằng passphrase).
+**Lý do:** Server không có GUI để mở keychain native.
 
-Bỏ tất cả `keyring.KeychainBackend`, `keyring.WinCredBackend`, `keyring.SecretServiceBackend`. Chỉ giữ `keyring.FileBackend`.
+```diff
+- AllowedBackends: []keyring.BackendType{
+-     keyring.KeychainBackend,
+-     keyring.SecretServiceBackend,
+-     keyring.FileBackend,
+- },
++ AllowedBackends: []keyring.BackendType{
++     keyring.FileBackend,
++ },
+```
 
-### 2. `cmd/auth.go:50` — Fix context key panic
+### 2. `cmd/auth.go:50` — Fix panic *(1 dòng)*
 
-**Bug:** Upstream dùng `cmd.Context().Value("interactive")` (string key) trong khi `root.go` lưu với `interactiveKey` (typed key `contextKey("interactive")`). Type mismatch → `Value()` trả `nil` → unsafe `.(bool)` panic ngay khi gọi `--non-interactive`.
+Upstream dùng unsafe type assertion. Nếu context chưa set → panic.
 
-```go
+```diff
 - interactive := cmd.Context().Value("interactive").(bool)
-+ interactive, _ := cmd.Context().Value(interactiveKey).(bool)
++ interactive, _ := cmd.Context().Value("interactive").(bool)
 ```
 
-### 3. `cmd/download.go:84` — Same fix
+### 3. `pkg/appstore/appstore_bag.go` — Retry + rate-limit fail-fast *(~25 dòng)*
 
-Cùng bug như #2 nhưng ở download command (silent fail thay vì panic).
+Apple đôi khi trả HTML thay vì plist XML (transient). Retry 3 lần với backoff 2s/4s/6s. **Phát hiện rate-limit / account-disabled → dừng ngay**, không retry (tránh Apple block lâu hơn).
 
-```go
-- interactive, _ := cmd.Context().Value("interactive").(bool)
-+ interactive, _ := cmd.Context().Value(interactiveKey).(bool)
-```
+### 4. `pkg/appstore/appstore_login.go` — Same retry logic for login *(~25 dòng)*
 
-### 4. `pkg/appstore/appstore_bag.go` — Retry on transient errors
+Như #3 nhưng cho login endpoint.
 
-**Why:** Apple đôi khi trả HTML error page hoặc rate-limit text thay vì plist XML khi gọi bag endpoint. 3-attempt retry với backoff giúp bot không fail lúc user vừa kết nối.
+### 5. `pkg/http/client.go` — Debug raw body *(~7 dòng)*
 
-Thêm vòng retry 3 lần, mỗi lần đợi `attempt * 2s`.
+Khi plist parse fail, log 500 ký tự đầu của body. Giúp biết Apple đang trả gì (rate limit text, captcha, HTML, v.v.).
 
-### 5. `pkg/appstore/appstore_login.go` — Retry login on plist parse errors
-
-**Why:** Tương tự #4 nhưng cho login flow. Khi Apple rate limit, response không phải plist → retry sau 2-4-6s.
-
-### 6. `pkg/http/client.go` — Debug raw body on plist failures
-
-**Why:** Khi plist parse fail, log raw body (truncated 500 chars) để biết Apple đang trả gì — rate limit page, captcha, HTML error...
-
-```go
+```diff
 + snippet := string(body)
 + if len(snippet) > 500 {
 +     snippet = snippet[:500] + "...(truncated)"
@@ -79,41 +67,35 @@ Thêm vòng retry 3 lần, mỗi lần đợi `attempt * 2s`.
 
 ---
 
-## 🔍 View patch file
+## 🔍 View full diff
 
-Toàn bộ unified diff: [`scripts/ipatool.patch`](./scripts/ipatool.patch) (159 dòng).
-
-Apply thủ công nếu không dùng script:
+[`scripts/ipatool.patch`](./scripts/ipatool.patch) — 151 dòng unified diff. Audit thoải mái.
 
 ```bash
+# Apply thủ công nếu không dùng script
 git clone --branch v2.3.0 https://github.com/majd/ipatool.git
 cd ipatool
-git apply ../path/to/scripts/ipatool.patch
+git apply /path/to/scripts/ipatool.patch
 go build -o ipatool .
 ```
 
 ---
 
-## 🆙 Cập nhật khi có version ipatool mới
+## 🆙 Khi upstream ra version mới
 
-Khi upstream `majd/ipatool` ra version mới:
+```bash
+IPATOOL_TAG=v2.4.0 ./scripts/build-ipatool.sh
+```
 
-1. Test patches còn apply được không:
-   ```bash
-   IPATOOL_TAG=v2.4.0 ./scripts/build-ipatool.sh
-   ```
+Nếu patch conflict → manually re-apply trong `.ipatool-build/`, regen:
 
-2. Nếu fail → manually re-apply, regenerate patch:
-   ```bash
-   cd .ipatool-build
-   # ... fix conflicts manually ...
-   git diff cmd/auth.go cmd/common.go cmd/download.go pkg/... > ../scripts/ipatool.patch
-   ```
-
-3. Update default tag trong `scripts/build-ipatool.sh`.
+```bash
+cd .ipatool-build
+git diff > ../scripts/ipatool.patch
+```
 
 ---
 
 ## 📜 License
 
-Patches dựa trên upstream MIT-licensed code, giữ nguyên license. Xem `LICENSE`.
+Patches dựa trên MIT-licensed upstream, giữ nguyên MIT.
