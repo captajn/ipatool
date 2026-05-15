@@ -12,14 +12,14 @@ index 34e1d4a..9ed0662 100644
  			if password == "" && !interactive {
  				return errors.New("password is required when not running in interactive mode; use the \"--password\" flag")
 diff --git a/cmd/common.go b/cmd/common.go
-index 03db1e7..ff0f994 100644
+index 03db1e7..135d18e 100644
 --- a/cmd/common.go
 +++ b/cmd/common.go
 @@ -62,9 +62,8 @@ func newCookieJar(machine machine.Machine) http.CookieJar {
  // newKeychain returns a new keychain instance.
  func newKeychain(machine machine.Machine, logger log.Logger, interactive bool) keychain.Keychain {
  	ring := util.Must(keyring.Open(keyring.Config{
-+		// Patched: FileBackend only - bot runs headless, no GUI
++		// Patched: FileBackend only (headless)
  		AllowedBackends: []keyring.BackendType{
 -			keyring.KeychainBackend,
 -			keyring.SecretServiceBackend,
@@ -27,7 +27,7 @@ index 03db1e7..ff0f994 100644
  		},
  		ServiceName: KeychainServiceName,
 diff --git a/pkg/appstore/appstore_bag.go b/pkg/appstore/appstore_bag.go
-index 29108a2..a02adc9 100644
+index 29108a2..79d891e 100644
 --- a/pkg/appstore/appstore_bag.go
 +++ b/pkg/appstore/appstore_bag.go
 @@ -4,6 +4,7 @@ import (
@@ -38,7 +38,7 @@ index 29108a2..a02adc9 100644
  
  	"github.com/majd/ipatool/v2/pkg/http"
  )
-@@ -23,18 +24,35 @@ func (t *appstore) Bag(input BagInput) (BagOutput, error) {
+@@ -23,18 +24,34 @@ func (t *appstore) Bag(input BagInput) (BagOutput, error) {
  	guid := strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
  	req := t.bagRequest(guid)
  
@@ -49,8 +49,7 @@ index 29108a2..a02adc9 100644
 -
 -	if res.StatusCode != gohttp.StatusOK {
 -		return BagOutput{}, fmt.Errorf("received unexpected status code: %d", res.StatusCode)
-+	// Patched: Retry up to 3 times when Apple returns non-plist (transient).
-+	// Fail-fast on rate-limit / account-disabled to avoid extending Apple block.
++	// Patched: retry up to 3 times; fail-fast on rate-limit/account-disabled
 +	var lastErr error
 +	for attempt := 0; attempt < 3; attempt++ {
 +		if attempt > 0 {
@@ -86,7 +85,7 @@ index 29108a2..a02adc9 100644
  
  type bagResult struct {
 diff --git a/pkg/appstore/appstore_login.go b/pkg/appstore/appstore_login.go
-index 419fdea..9c5e5ff 100644
+index 419fdea..df9fcb2 100644
 --- a/pkg/appstore/appstore_login.go
 +++ b/pkg/appstore/appstore_login.go
 @@ -7,6 +7,7 @@ import (
@@ -97,7 +96,7 @@ index 419fdea..9c5e5ff 100644
  
  	"github.com/majd/ipatool/v2/pkg/http"
  	"github.com/majd/ipatool/v2/pkg/util"
-@@ -76,10 +77,29 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string) (Acco
+@@ -76,10 +77,27 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string) (Acco
  	for attempt := 1; retry && attempt <= 4; attempt++ {
  		request := t.loginRequest(email, password, authCode, guid, endpoint, attempt)
  		request.URL, _ = util.IfEmpty(redirect, request.URL), ""
@@ -105,8 +104,6 @@ index 419fdea..9c5e5ff 100644
  
 -		if err != nil {
 -			return Account{}, fmt.Errorf("request failed: %w", err)
-+		// Patched: retry transient plist parse errors (rate limit page etc.),
-+		// fail-fast on explicit rate limit / account disabled
 +		var sendErr error
 +		for sendTry := 0; sendTry < 3; sendTry++ {
 +			res, sendErr = t.loginClient.Send(request)
@@ -131,16 +128,14 @@ index 419fdea..9c5e5ff 100644
  
  		if retry, redirect, err = t.parseLoginResponse(&res, attempt, authCode); err != nil {
 diff --git a/pkg/http/client.go b/pkg/http/client.go
-index 496d02c..4850bb7 100644
+index 496d02c..c4163b5 100644
 --- a/pkg/http/client.go
 +++ b/pkg/http/client.go
-@@ -166,7 +166,13 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
+@@ -166,7 +166,11 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
  
  	_, err = plist.Unmarshal(normalizedBody, &data)
  	if err != nil {
 -		return Result[R]{}, fmt.Errorf("failed to unmarshal xml: %w", err)
-+		// Patched: include raw body preview to debug what Apple returned
-+		// (rate limit page, captcha, HTML error, etc.)
 +		snippet := string(body)
 +		if len(snippet) > 500 {
 +			snippet = snippet[:500] + "...(truncated)"
@@ -149,3 +144,39 @@ index 496d02c..4850bb7 100644
  	}
  
  	headers := map[string]string{}
+diff --git a/pkg/util/machine/machine.go b/pkg/util/machine/machine.go
+index d2376e2..57e06ca 100644
+--- a/pkg/util/machine/machine.go
++++ b/pkg/util/machine/machine.go
+@@ -3,13 +3,20 @@ package machine
+ import (
+ 	"fmt"
+ 	"net"
++	"os"
+ 	"path/filepath"
++	"regexp"
+ 	"runtime"
+ 
+ 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
+ 	"golang.org/x/term"
+ )
+ 
++// Patched: env IPATOOL_MAC_OVERRIDE allows per-user GUID for bots.
++const envMacOverride = "IPATOOL_MAC_OVERRIDE"
++
++var macFormatRe = regexp.MustCompile(`^([0-9A-Fa-f]{2}[:-]?){5}[0-9A-Fa-f]{2}$`)
++
+ //go:generate go run go.uber.org/mock/mockgen -source=machine.go -destination=machine_mock.go -package machine
+ type Machine interface {
+ 	MacAddress() (string, error)
+@@ -32,6 +39,10 @@ func New(args Args) Machine {
+ }
+ 
+ func (*machine) MacAddress() (string, error) {
++	if override := os.Getenv(envMacOverride); override != "" && macFormatRe.MatchString(override) {
++		return override, nil
++	}
++
+ 	interfaces, err := net.Interfaces()
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to get network interfaces: %w", err)

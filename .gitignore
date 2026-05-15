@@ -6,14 +6,14 @@
 tmp/
 public/
 
-# Build artifacts
-ipa-downloader-bot
-ipa-downloader-bot.exe
-ipatool
-ipatool.exe
-ipatool-*.exe
-ipatool-linux-amd64
-ipatool-windows-amd64
+# Build artifacts (only at repo root)
+/ipa-downloader-bot
+/ipa-downloader-bot.exe
+/ipatool
+/ipatool.exe
+/ipatool-*.exe
+/ipatool-linux-amd64
+/ipatool-windows-amd64
 *.tar.gz
 *.zip
 
