@@ -44,7 +44,7 @@ index 0df1d36..30d7693 100644
  				if interactive {
  					progress = progressbar.NewOptions64(1,
 diff --git a/pkg/appstore/appstore_bag.go b/pkg/appstore/appstore_bag.go
-index 29108a2..8957c7a 100644
+index 29108a2..faa3721 100644
 --- a/pkg/appstore/appstore_bag.go
 +++ b/pkg/appstore/appstore_bag.go
 @@ -4,6 +4,7 @@ import (
@@ -55,7 +55,7 @@ index 29108a2..8957c7a 100644
  
  	"github.com/majd/ipatool/v2/pkg/http"
  )
-@@ -23,18 +24,36 @@ func (t *appstore) Bag(input BagInput) (BagOutput, error) {
+@@ -23,18 +24,40 @@ func (t *appstore) Bag(input BagInput) (BagOutput, error) {
  	guid := strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
  	req := t.bagRequest(guid)
  
@@ -63,8 +63,8 @@ index 29108a2..8957c7a 100644
 -	if err != nil {
 -		return BagOutput{}, fmt.Errorf("failed to send http request: %w", err)
 -	}
-+	// Retry up to 3 times — Apple occasionally returns non-plist responses
-+	// (HTML error pages, empty bodies, etc.) on transient failures.
++	// Retry up to 3 times — Apple occasionally returns non-plist responses.
++	// KHÔNG retry khi rate limit / account disabled — fail fast.
 +	var lastErr error
 +	for attempt := 0; attempt < 3; attempt++ {
 +		if attempt > 0 {
@@ -74,6 +74,10 @@ index 29108a2..8957c7a 100644
 +		res, err := t.bagClient.Send(req)
 +		if err != nil {
 +			lastErr = fmt.Errorf("attempt %d: %w", attempt+1, err)
++			errLow := strings.ToLower(err.Error())
++			if strings.Contains(errLow, "rate limit") || strings.Contains(errLow, "account is disabled") {
++				break // fail fast, don't make Apple block worse
++			}
 +			continue
 +		}
 +
@@ -102,7 +106,7 @@ index 29108a2..8957c7a 100644
  
  type bagResult struct {
 diff --git a/pkg/appstore/appstore_login.go b/pkg/appstore/appstore_login.go
-index 419fdea..cafa943 100644
+index 419fdea..d8fa7af 100644
 --- a/pkg/appstore/appstore_login.go
 +++ b/pkg/appstore/appstore_login.go
 @@ -7,6 +7,7 @@ import (
@@ -113,7 +117,7 @@ index 419fdea..cafa943 100644
  
  	"github.com/majd/ipatool/v2/pkg/http"
  	"github.com/majd/ipatool/v2/pkg/util"
-@@ -76,10 +77,22 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string) (Acco
+@@ -76,10 +77,31 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string) (Acco
  	for attempt := 1; retry && attempt <= 4; attempt++ {
  		request := t.loginRequest(email, password, authCode, guid, endpoint, attempt)
  		request.URL, _ = util.IfEmpty(redirect, request.URL), ""
@@ -121,14 +125,23 @@ index 419fdea..cafa943 100644
  
 -		if err != nil {
 -			return Account{}, fmt.Errorf("request failed: %w", err)
-+		// Retry transient parse errors (Apple sometimes returns HTML instead of plist)
++		// Retry transient parse errors (Apple sometimes returns HTML instead of plist).
++		// IMPORTANT: KHÔNG retry khi Apple đã rate limit — sẽ làm tệ hơn,
++		// kéo dài thời gian Apple block IP.
 +		var sendErr error
 +		for sendTry := 0; sendTry < 3; sendTry++ {
 +			res, sendErr = t.loginClient.Send(request)
 +			if sendErr == nil {
 +				break
 +			}
-+			if strings.Contains(sendErr.Error(), "unmarshal") || strings.Contains(sendErr.Error(), "plist") {
++			errLow := strings.ToLower(sendErr.Error())
++			// Rate limit / account disabled / explicit block — fail fast, don't retry
++			if strings.Contains(errLow, "rate limit") ||
++				strings.Contains(errLow, "account is disabled") ||
++				strings.Contains(errLow, "account has been locked") {
++				break
++			}
++			if strings.Contains(errLow, "unmarshal") || strings.Contains(errLow, "plist") {
 +				time.Sleep(time.Duration(sendTry+1) * 2 * time.Second)
 +				continue
 +			}
