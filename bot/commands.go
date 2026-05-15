@@ -17,7 +17,8 @@ import (
 
 func (b *Bot) HandleMessage(msg *tgbotapi.Message) {
 	ctx := context.Background()
-	user, err := b.DB.GetUser(ctx, msg.Chat.ID)
+	userID := userIDOf(msg)
+	user, err := b.DB.GetUser(ctx, userID)
 	if err != nil {
 		log.Printf("Error getting user: %v", err)
 		return
@@ -25,7 +26,7 @@ func (b *Bot) HandleMessage(msg *tgbotapi.Message) {
 
 	// 1. Always prioritize commands (like /start to reset state)
 	if msg.IsCommand() {
-		b.DB.UpdateUser(ctx, msg.Chat.ID, bson.M{"$set": bson.M{"lastUsed": time.Now().UnixMilli()}})
+		b.DB.UpdateUser(ctx, userID, bson.M{"$set": bson.M{"lastUsed": time.Now().UnixMilli()}})
 		switch msg.Command() {
 		case "start":
 			b.handleStart(msg)
@@ -52,7 +53,12 @@ func (b *Bot) HandleMessage(msg *tgbotapi.Message) {
 		case "accounts":
 			b.handleAccounts(msg)
 		case "addaccount":
-			b.startLogin(msg.Chat.ID)
+			// Login phải ở DM — bảo vệ password khỏi group
+			if !isPrivateChat(msg) {
+				b.replyDMRequired(msg)
+				return
+			}
+			b.startLogin(msg.Chat.ID, userID)
 		case "clearall":
 			b.handleClearAll(msg)
 		case "login":
@@ -61,15 +67,20 @@ func (b *Bot) HandleMessage(msg *tgbotapi.Message) {
 		return
 	}
 
-	// 2. Handle multi-step login/input steps
+	// Group: chỉ chấp nhận command, không xử lý plain text (tránh nhầm với chat thường trong group)
+	if !isPrivateChat(msg) {
+		return
+	}
+
+	// 2. Handle multi-step login/input steps (chỉ trong DM)
 	if user != nil && user.LoginStep != "" && user.LoginStep != "awaiting_app_id" {
-		b.DB.UpdateUser(ctx, msg.Chat.ID, bson.M{"$set": bson.M{"lastUsed": time.Now().UnixMilli()}})
+		b.DB.UpdateUser(ctx, userID, bson.M{"$set": bson.M{"lastUsed": time.Now().UnixMilli()}})
 		b.handleLoginStep(msg, user)
 		return
 	}
 
 	if msg.Text != "" {
-		b.DB.UpdateUser(ctx, msg.Chat.ID, bson.M{"$set": bson.M{"lastUsed": time.Now().UnixMilli()}})
+		b.DB.UpdateUser(ctx, userID, bson.M{"$set": bson.M{"lastUsed": time.Now().UnixMilli()}})
 	}
 
 	// 3. Auto-detect App Store links / app IDs — show version selection menu
@@ -91,38 +102,64 @@ func (b *Bot) HandleMessage(msg *tgbotapi.Message) {
 	}
 }
 
+// replyDMRequired báo user cần chuyển sang DM (chat riêng) cho thao tác nhạy cảm.
+func (b *Bot) replyDMRequired(msg *tgbotapi.Message) {
+	botUsername := b.API.Self.UserName
+	text := fmt.Sprintf("🔒 <b>Vui lòng đăng nhập trong chat riêng</b> để bảo vệ mật khẩu của bạn.\n\n"+
+		"👉 Nhấn vào <a href=\"https://t.me/%s?start=login\">@%s</a> để mở chat riêng với bot.",
+		botUsername, botUsername)
+	reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+	reply.ParseMode = "HTML"
+	reply.DisableWebPagePreview = true
+	reply.ReplyToMessageID = msg.MessageID
+	reply.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("💬 Mở chat riêng", fmt.Sprintf("https://t.me/%s?start=login", botUsername)),
+		),
+	)
+	b.SafeSend(reply)
+}
+
 func (b *Bot) handleStart(msg *tgbotapi.Message) {
 	ctx := context.Background()
+	chatID := msg.Chat.ID
+	userID := userIDOf(msg)
 
 	// Reset session state
-	b.DB.UpdateUser(ctx, msg.Chat.ID, bson.M{"$set": bson.M{"loginStep": ""}})
-	b.DB.UnsetFields(ctx, msg.Chat.ID, bson.M{"tempAppleId": "", "password": ""})
+	b.DB.UpdateUser(ctx, userID, bson.M{"$set": bson.M{"loginStep": ""}})
+	b.DB.UnsetFields(ctx, userID, bson.M{"tempAppleId": "", "password": ""})
 
 	// Cleanup any leftover bot prompts
-	if promptID, ok := b.State.Load(fmt.Sprintf("prompt_%d", msg.Chat.ID)); ok {
-		b.SafeDelete(msg.Chat.ID, promptID.(int))
-		b.State.Delete(fmt.Sprintf("prompt_%d", msg.Chat.ID))
+	if promptID, ok := b.State.Load(fmt.Sprintf("prompt_%d", userID)); ok {
+		b.SafeDelete(chatID, promptID.(int))
+		b.State.Delete(fmt.Sprintf("prompt_%d", userID))
 	}
 
-	user, _ := b.DB.GetUser(ctx, msg.Chat.ID)
+	user, _ := b.DB.GetUser(ctx, userID)
 
 	if user == nil {
+		fromName, fromUser := "", ""
+		if msg.From != nil {
+			fromName = msg.From.FirstName
+			fromUser = msg.From.UserName
+		}
 		user = &db.User{
-			ID:         msg.Chat.ID,
-			FirstName:  msg.From.FirstName,
-			Username:   msg.From.UserName,
+			ID:         userID,
+			FirstName:  fromName,
+			Username:   fromUser,
 			CreatedAt:  time.Now().UnixMilli(),
 			UsageCount: 0,
 		}
 		b.DB.SaveUser(ctx, user)
 	}
 
-	greeting := msg.From.FirstName
-	if greeting == "" {
-		greeting = msg.From.UserName
-	}
-	if greeting == "" {
-		greeting = "bạn"
+	greeting := "bạn"
+	if msg.From != nil {
+		if msg.From.FirstName != "" {
+			greeting = msg.From.FirstName
+		} else if msg.From.UserName != "" {
+			greeting = msg.From.UserName
+		}
 	}
 
 	var text string
@@ -136,7 +173,7 @@ func (b *Bot) handleStart(msg *tgbotapi.Message) {
 				"🔑 <b>Bắt đầu:</b> Đăng nhập Apple ID để tải IPA\n"+
 				"📲 <b>Tải app:</b> Gửi link App Store hoặc dùng /get\n"+
 				"👥 <b>Nhiều tài khoản:</b> Thêm/chuyển Apple ID dễ dàng\n\n"+
-				"<i>🔒 Tài khoản của bạn được mã hoá lưu trữ. Xem /privacy.</i>",
+				"<i>🔒 Password mã hoá AES-256 trước khi lưu. Source code public, xem /privacy.</i>",
 			html.EscapeString(greeting),
 		)
 		keyboard = tgbotapi.NewInlineKeyboardMarkup(
@@ -146,6 +183,9 @@ func (b *Bot) handleStart(msg *tgbotapi.Message) {
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("ℹ️ Trợ giúp", "help"),
 				tgbotapi.NewInlineKeyboardButtonData("🔒 Bảo mật", "privacy"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonURL("📂 Source code GitHub", "https://github.com/captajn/ipatool"),
 			),
 		)
 	} else {
@@ -193,7 +233,7 @@ func (b *Bot) handleStart(msg *tgbotapi.Message) {
 		)
 	}
 
-	reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+	reply := tgbotapi.NewMessage(chatID, text)
 	reply.ParseMode = "HTML"
 	reply.DisableWebPagePreview = true
 	reply.ReplyMarkup = keyboard
@@ -204,9 +244,9 @@ func (b *Bot) handleStart(msg *tgbotapi.Message) {
 // Dùng để reset hoàn toàn — chủ yếu để test/troubleshoot.
 func (b *Bot) handleClearAll(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
+	userID := userIDOf(msg)
 	ctx := context.Background()
 
-	// Confirm bằng button: chỉ xóa khi user bấm xác nhận
 	if msg.CommandArguments() != "confirm" {
 		reply := tgbotapi.NewMessage(chatID, "⚠️ <b>Xóa toàn bộ dữ liệu của bạn?</b>\n\n"+
 			"• Tất cả Apple IDs đã đăng nhập\n"+
@@ -218,13 +258,11 @@ func (b *Bot) handleClearAll(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Xóa keychain + DB
-	b.IPATool.ResetSession(chatID)
-	if _, err := b.DB.Users.DeleteOne(ctx, bson.M{"userId": chatID}); err != nil {
-		log.Printf("⚠️ ClearAll DB delete user=%d: %v", chatID, err)
+	b.IPATool.ResetSession(userID)
+	if _, err := b.DB.Users.DeleteOne(ctx, bson.M{"userId": userID}); err != nil {
+		log.Printf("⚠️ ClearAll DB delete user=%d: %v", userID, err)
 	}
-	// Cũng xóa thư mục home của user (defensive — ResetSession mới chỉ xóa .ipatool/)
-	homeDir := filepath.Join(b.IPATool.BaseDir, "users", fmt.Sprintf("%d", chatID))
+	homeDir := filepath.Join(b.IPATool.BaseDir, "users", fmt.Sprintf("%d", userID))
 	_ = os.RemoveAll(homeDir)
 
 	reply := tgbotapi.NewMessage(chatID, "✅ <b>Đã xóa toàn bộ dữ liệu.</b>\nGửi /start để bắt đầu lại từ đầu. 🔄")
@@ -234,17 +272,21 @@ func (b *Bot) handleClearAll(msg *tgbotapi.Message) {
 
 func (b *Bot) handleLogout(msg *tgbotapi.Message) {
 	ctx := context.Background()
-	b.DB.UnsetFields(ctx, msg.Chat.ID, bson.M{"appleId": "", "password": ""})
-	b.IPATool.ResetSession(msg.Chat.ID)
-	reply := tgbotapi.NewMessage(msg.Chat.ID, "Đã đăng xuất và xóa phiên làm việc. 🚪")
+	chatID := msg.Chat.ID
+	userID := userIDOf(msg)
+	b.DB.UnsetFields(ctx, userID, bson.M{"appleId": "", "password": ""})
+	b.IPATool.ResetSession(userID)
+	reply := tgbotapi.NewMessage(chatID, "Đã đăng xuất và xóa phiên làm việc. 🚪")
 	reply.ParseMode = "HTML"
 	b.SafeSend(reply)
 }
 
 // handleGetCommand xử lý /get <link|appID> — tải thẳng phiên bản mới nhất, bỏ qua menu.
 func (b *Bot) handleGetCommand(msg *tgbotapi.Message, user *db.User) {
+	chatID := msg.Chat.ID
+	userID := userIDOf(msg)
 	if user == nil || user.AppleID == "" {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "Vui lòng đăng nhập trước khi tải IPA. 🔑\nDùng /start để bắt đầu.")
+		reply := tgbotapi.NewMessage(chatID, "Vui lòng đăng nhập trước khi tải IPA. 🔑\nDùng /start để bắt đầu.")
 		reply.ParseMode = "HTML"
 		reply.ReplyToMessageID = msg.MessageID
 		b.SafeSend(reply)
@@ -253,7 +295,7 @@ func (b *Bot) handleGetCommand(msg *tgbotapi.Message, user *db.User) {
 
 	arg := msg.CommandArguments()
 	if arg == "" {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "📲 <b>Cách dùng:</b>\n<code>/get &lt;link App Store hoặc AppID&gt;</code>\n\nVí dụ:\n<code>/get https://apps.apple.com/app/id6446659989</code>\n<code>/get 6446659989</code>")
+		reply := tgbotapi.NewMessage(chatID, "📲 <b>Cách dùng:</b>\n<code>/get &lt;link App Store hoặc AppID&gt;</code>\n\nVí dụ:\n<code>/get https://apps.apple.com/app/id6446659989</code>\n<code>/get 6446659989</code>")
 		reply.ParseMode = "HTML"
 		reply.ReplyToMessageID = msg.MessageID
 		b.SafeSend(reply)
@@ -262,15 +304,15 @@ func (b *Bot) handleGetCommand(msg *tgbotapi.Message, user *db.User) {
 
 	appID := b.extractAppID(arg)
 	if appID == "" {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "❌ <b>Không tìm thấy App ID hợp lệ.</b>\nGửi link App Store hoặc số App ID.")
+		reply := tgbotapi.NewMessage(chatID, "❌ <b>Không tìm thấy App ID hợp lệ.</b>\nGửi link App Store hoặc số App ID.")
 		reply.ParseMode = "HTML"
 		reply.ReplyToMessageID = msg.MessageID
 		b.SafeSend(reply)
 		return
 	}
 
-	b.State.Store(fmt.Sprintf("origin_%d", msg.Chat.ID), msg.MessageID)
-	b.executeDownload(msg.Chat.ID, appID, "")
+	b.State.Store(fmt.Sprintf("origin_%d", userID), msg.MessageID)
+	b.executeDownload(chatID, userID, appID, "")
 }
 
 func (b *Bot) handleHelp(msg *tgbotapi.Message) {
@@ -297,11 +339,16 @@ func (b *Bot) handleHelp(msg *tgbotapi.Message) {
 
 <b>🔒 Khác:</b>
 • /privacy — chính sách bảo mật
-• /start — quay về menu chính`
+• /start — quay về menu chính
+
+<b>📂 Open source:</b> <a href="https://github.com/captajn/ipatool">github.com/captajn/ipatool</a>`
 	reply := tgbotapi.NewMessage(msg.Chat.ID, text)
 	reply.ParseMode = "HTML"
 	reply.DisableWebPagePreview = true
 	reply.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("📂 Source code", "https://github.com/captajn/ipatool"),
+		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("⬅️ Quay lại", "back_start"),
 		),
@@ -312,18 +359,29 @@ func (b *Bot) handleHelp(msg *tgbotapi.Message) {
 func (b *Bot) handlePrivacy(msg *tgbotapi.Message) {
 	text := `🔒 <b>Chính sách bảo mật:</b>
 
-• Tất cả thông tin đăng nhập đều gửi <b>thẳng tới Apple</b> để xử lý — bot chỉ là cầu nối.
-• Apple ID có thể bị khoá nếu nhập sai mật khẩu nhiều lần (cơ chế bảo vệ của Apple, không phải lỗi bot).
+• Tất cả thông tin đăng nhập đều gửi <b>thẳng tới Apple</b> — bot chỉ là cầu nối, không qua server thứ 3.
+• Password được mã hoá <b>AES-256-GCM</b> trước khi lưu DB.
+• Mã 2FA chỉ tồn tại trong RAM lúc xử lý, không log/lưu.
+• Apple ID có thể bị khoá nếu nhập sai mật khẩu nhiều lần (cơ chế bảo vệ của Apple).
 • Khuyến khích dùng <b>Apple ID phụ</b> nếu chưa tin tưởng.
 
 <b>📂 Mã nguồn mở:</b>
-Toàn bộ source code của bot sẽ được public rõ ràng trên GitHub để bạn tự kiểm tra. Bạn có thể tự host bot riêng nếu muốn.
+🔗 <a href="https://github.com/captajn/ipatool">github.com/captajn/ipatool</a>
+
+Bạn có thể:
+• Đọc full source code (không có gì ẩn)
+• Audit bảo mật theo SECURITY.md
+• Self-host bot riêng trên server của bạn
 
 <b>⚠️ Miễn trừ trách nhiệm:</b>
 Bot không chịu trách nhiệm nếu có vấn đề xảy ra với tài khoản Apple ID của bạn.`
 	reply := tgbotapi.NewMessage(msg.Chat.ID, text)
 	reply.ParseMode = "HTML"
+	reply.DisableWebPagePreview = true
 	reply.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("📂 Source code GitHub", "https://github.com/captajn/ipatool"),
+		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("⬅️ Quay lại", "back_start"),
 		),

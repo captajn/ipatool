@@ -52,6 +52,32 @@ func NewBot(cfg *config.Config, database *db.MongoDB, cipher *crypto.Cipher) (*B
 	}, nil
 }
 
+// userIDOf trả Telegram user ID của người gửi message.
+// Trong private chat (DM), giá trị này == msg.Chat.ID.
+// Trong group/supergroup, msg.From.ID khác msg.Chat.ID — phải dùng From.ID
+// để xác định danh tính user (không bị trộn lẫn với group khác).
+func userIDOf(msg *tgbotapi.Message) int64 {
+	if msg.From != nil {
+		return msg.From.ID
+	}
+	return msg.Chat.ID // fallback (channel post case)
+}
+
+// userIDOfCallback trả Telegram user ID của người bấm button.
+// query.From là user click, query.Message.Chat là nơi button xuất hiện.
+func userIDOfCallback(query *tgbotapi.CallbackQuery) int64 {
+	if query.From != nil {
+		return query.From.ID
+	}
+	return query.Message.Chat.ID
+}
+
+// isPrivateChat kiểm tra message có đến từ DM (private chat) hay không.
+// Login PHẢI làm trong DM để password không lộ trong group.
+func isPrivateChat(msg *tgbotapi.Message) bool {
+	return msg.Chat != nil && msg.Chat.Type == "private"
+}
+
 // encPwd helper: mã hoá password để lưu DB. Trả "" cho input rỗng.
 func (b *Bot) encPwd(plain string) string {
 	if plain == "" {

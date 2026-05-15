@@ -30,6 +30,7 @@ Repo này (https://github.com/captajn/ipatool) là **bản fork & chỉnh sửa*
 - 🌐 **Multi-region lookup** — tìm app trên 14 vùng khác nhau (us, vn, jp, gb, de, fr, kr, cn, sg, th, au, tw, ca, in)
 - 🔗 **Web installer link** — tạo link cài trực tiếp lên iPhone/iPad qua `/getlink`
 - ⚡ **Fast login** — đăng nhập 1 dòng `/login email password`
+- 👨‍👩‍👧 **Hoạt động trong nhóm** — add bot vào group để chia sẻ, mỗi user vẫn login DM riêng
 - 🛡️ **Privacy-first** — credentials được mask trong log
 
 ### 🔒 Cam kết riêng tư & bảo mật

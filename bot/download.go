@@ -23,37 +23,37 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 )
 
-func (b *Bot) promptDownload(chatID int64) {
+func (b *Bot) promptDownload(chatID, userID int64) {
 	ctx := context.Background()
-	b.DB.UpdateUser(ctx, chatID, bson.M{"$set": bson.M{"loginStep": "awaiting_app_id"}})
+	b.DB.UpdateUser(ctx, userID, bson.M{"$set": bson.M{"loginStep": "awaiting_app_id"}})
 	msg := tgbotapi.NewMessage(chatID, "Vui lòng gửi link App Store hoặc AppID: 🔗")
 	msg.ParseMode = "HTML"
 	sent, _ := b.SafeSend(msg)
-	b.State.Store(fmt.Sprintf("prompt_%d", chatID), sent.MessageID)
+	b.State.Store(fmt.Sprintf("prompt_%d", userID), sent.MessageID)
 }
 
 func (b *Bot) handleDownloadRequest(msg *tgbotapi.Message) {
 	ctx := context.Background()
-	// Store origin message ID to reply to it later
-	b.State.Store(fmt.Sprintf("origin_%d", msg.Chat.ID), msg.MessageID)
+	chatID := msg.Chat.ID
+	userID := userIDOf(msg)
 
-	// Delete ONLY bot's prompt, keep user's link message
-	if promptID, ok := b.State.Load(fmt.Sprintf("prompt_%d", msg.Chat.ID)); ok {
-		b.SafeDelete(msg.Chat.ID, promptID.(int))
-		b.State.Delete(fmt.Sprintf("prompt_%d", msg.Chat.ID))
+	b.State.Store(fmt.Sprintf("origin_%d", userID), msg.MessageID)
+
+	if promptID, ok := b.State.Load(fmt.Sprintf("prompt_%d", userID)); ok {
+		b.SafeDelete(chatID, promptID.(int))
+		b.State.Delete(fmt.Sprintf("prompt_%d", userID))
 	}
 
 	appID := b.extractAppID(msg.Text)
 	if appID == "" {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "❌ <b>Link hoặc AppID không hợp lệ.</b> 🚫")
+		reply := tgbotapi.NewMessage(chatID, "❌ <b>Link hoặc AppID không hợp lệ.</b> 🚫")
 		reply.ParseMode = "HTML"
 		reply.ReplyToMessageID = msg.MessageID
 		b.SafeSend(reply)
 		return
 	}
 
-	// Clear state after getting ID
-	b.DB.UpdateUser(ctx, msg.Chat.ID, bson.M{"$set": bson.M{"loginStep": ""}})
+	b.DB.UpdateUser(ctx, userID, bson.M{"$set": bson.M{"loginStep": ""}})
 
 	appInfo, _ := itunes.GetAppInfo(appID)
 	appName := "ID: " + appID
@@ -70,20 +70,20 @@ func (b *Bot) handleDownloadRequest(msg *tgbotapi.Message) {
 		),
 	)
 
-	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📦 <b>Ứng dụng:</b> <code>%s</code> 🌟\nChọn phiên bản để tải:", html.EscapeString(appName)))
+	reply := tgbotapi.NewMessage(chatID, fmt.Sprintf("📦 <b>Ứng dụng:</b> <code>%s</code> 🌟\nChọn phiên bản để tải:", html.EscapeString(appName)))
 	reply.ParseMode = "HTML"
 	reply.ReplyMarkup = keyboard
 	reply.ReplyToMessageID = msg.MessageID
 	b.SafeSend(reply)
 }
 
-func (b *Bot) promptOldVersion(chatID int64, appID string) {
+func (b *Bot) promptOldVersion(chatID, userID int64, appID string) {
 	ctx := context.Background()
-	b.DB.UpdateUser(ctx, chatID, bson.M{"$set": bson.M{"loginStep": "awaiting_app_ver_id", "tempAppleId": appID}})
-	
+	b.DB.UpdateUser(ctx, userID, bson.M{"$set": bson.M{"loginStep": "awaiting_app_ver_id", "tempAppleId": appID}})
+
 	msg := tgbotapi.NewMessage(chatID, "Vui lòng nhập appVerId của phiên bản cũ: 📜")
 	msg.ParseMode = "HTML"
-	if originID, ok := b.State.Load(fmt.Sprintf("origin_%d", chatID)); ok {
+	if originID, ok := b.State.Load(fmt.Sprintf("origin_%d", userID)); ok {
 		msg.ReplyToMessageID = originID.(int)
 	}
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
@@ -92,19 +92,22 @@ func (b *Bot) promptOldVersion(chatID int64, appID string) {
 		),
 	)
 	sent, _ := b.SafeSend(msg)
-	b.State.Store(fmt.Sprintf("prompt_%d", chatID), sent.MessageID)
+	b.State.Store(fmt.Sprintf("prompt_%d", userID), sent.MessageID)
 }
 
-func (b *Bot) executeDownload(chatID int64, appID string, appVerID string) {
+// executeDownload tải IPA về và upload lên Telegram.
+// chatID: nơi gửi tin nhắn / file (group hoặc DM của user).
+// userID: định danh user trong DB / ipatool keychain.
+func (b *Bot) executeDownload(chatID, userID int64, appID string, appVerID string) {
 	ctx := context.Background()
-	user, _ := b.DB.GetUser(ctx, chatID)
+	user, _ := b.DB.GetUser(ctx, userID)
 	if user == nil {
 		return
 	}
 
-	// SECURITY: Rate limit chống spam download
-	if !b.ActionLimit.Allow(chatID) {
-		retry := b.ActionLimit.RetryAfter(chatID)
+	// SECURITY: Rate limit chống spam download (key bằng userID)
+	if !b.ActionLimit.Allow(userID) {
+		retry := b.ActionLimit.RetryAfter(userID)
 		reply := tgbotapi.NewMessage(chatID, fmt.Sprintf("🚫 <b>Quá nhiều thao tác.</b>\nVui lòng đợi <b>%d giây</b>.", int(retry.Seconds())+1))
 		reply.ParseMode = "HTML"
 		b.SafeSend(reply)
@@ -127,7 +130,7 @@ func (b *Bot) executeDownload(chatID int64, appID string, appVerID string) {
 
 	waitMsg := tgbotapi.NewMessage(chatID, "🔍 <b>Đang kiểm tra ứng dụng từ Apple Store...</b>")
 	waitMsg.ParseMode = "HTML"
-	if originID, ok := b.State.Load(fmt.Sprintf("origin_%d", chatID)); ok {
+	if originID, ok := b.State.Load(fmt.Sprintf("origin_%d", userID)); ok {
 		waitMsg.ReplyToMessageID = originID.(int)
 	}
 	sentWait, _ := b.SafeSend(waitMsg)
@@ -153,19 +156,19 @@ func (b *Bot) executeDownload(chatID int64, appID string, appVerID string) {
 	edit.ParseMode = "HTML"
 	b.SafeEdit(edit)
 	var downloadedVersion, actualPath string
-	downloadedVersion, actualPath, err = b.IPATool.Download(chatID, appID, appVerID, outputPath)
+	downloadedVersion, actualPath, err = b.IPATool.Download(userID, appID, appVerID, outputPath)
 
 	// Auto-relogin if session is lost
 	if err != nil && strings.Contains(err.Error(), "failed to get account") && user.AppleID != "" && user.Password != "" {
 		editRelogin := tgbotapi.NewEditMessageText(chatID, sentWait.MessageID, "🔑 <b>Phiên đăng nhập hết hạn, đang tự động đăng nhập lại...</b>")
 		editRelogin.ParseMode = "HTML"
 		b.SafeEdit(editRelogin)
-		loginErr := b.IPATool.Login(chatID, user.AppleID, b.decPwd(user.Password), "")
+		loginErr := b.IPATool.Login(userID, user.AppleID, b.decPwd(user.Password), "")
 		if loginErr == nil {
-			downloadedVersion, actualPath, err = b.IPATool.Download(chatID, appID, appVerID, outputPath)
+			downloadedVersion, actualPath, err = b.IPATool.Download(userID, appID, appVerID, outputPath)
 		} else {
 			// Relogin failed
-			b.DB.UnsetFields(ctx, chatID, bson.M{"appleId": "", "password": ""})
+			b.DB.UnsetFields(ctx, userID, bson.M{"appleId": "", "password": ""})
 			edit := tgbotapi.NewEditMessageText(chatID, sentWait.MessageID, "❌ <b>Tự động đăng nhập thất bại.</b>\nTài khoản của bạn có thể yêu cầu 2FA hoặc mật khẩu đã đổi. Vui lòng đăng nhập lại bằng lệnh /start. 🔑")
 			edit.ParseMode = "HTML"
 			b.SafeEdit(edit)
@@ -180,11 +183,11 @@ func (b *Bot) executeDownload(chatID int64, appID string, appVerID string) {
 			editPurchase := tgbotapi.NewEditMessageText(chatID, sentWait.MessageID, "🛒 <b>Đang tự động 'Nhận' ứng dụng...</b>")
 			editPurchase.ParseMode = "HTML"
 			b.SafeEdit(editPurchase)
-			if pErr := b.IPATool.Purchase(chatID, appInfo.BundleId); pErr == nil {
+			if pErr := b.IPATool.Purchase(userID, appInfo.BundleId); pErr == nil {
 				editRetry := tgbotapi.NewEditMessageText(chatID, sentWait.MessageID, fmt.Sprintf("📥 <b>Đã 'Nhận' xong, đang tải lại IPA...</b>\n📦 <b>Ứng dụng:</b> <code>%s</code>", html.EscapeString(appName)))
 				editRetry.ParseMode = "HTML"
 				b.SafeEdit(editRetry)
-				downloadedVersion, actualPath, err = b.IPATool.Download(chatID, appID, appVerID, outputPath)
+				downloadedVersion, actualPath, err = b.IPATool.Download(userID, appID, appVerID, outputPath)
 			}
 		}
 	}
@@ -312,23 +315,22 @@ func (b *Bot) executeDownload(chatID int64, appID string, appVerID string) {
 	}
 
 	originID := 0
-	if val, ok := b.State.Load(fmt.Sprintf("origin_%d", chatID)); ok {
+	if val, ok := b.State.Load(fmt.Sprintf("origin_%d", userID)); ok {
 		originID = val.(int)
 	}
 	err = b.MTProto.UploadFile(ctx, chatID, outputPath, caption, thumbPath, originID, progressFn)
-	
-	// Cleanup wait message
+
 	b.SafeDelete(chatID, sentWait.MessageID)
 
 	if err != nil {
 		reply := tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ <b>Lỗi gửi file:</b> <code>%s</code>", html.EscapeString(err.Error())))
 		reply.ParseMode = "HTML"
-		if originID, ok := b.State.Load(fmt.Sprintf("origin_%d", chatID)); ok {
-			reply.ReplyToMessageID = originID.(int)
+		if val, ok := b.State.Load(fmt.Sprintf("origin_%d", userID)); ok {
+			reply.ReplyToMessageID = val.(int)
 		}
 		b.SafeSend(reply)
 	} else {
-		b.DB.UpdateUser(ctx, chatID, bson.M{
+		b.DB.UpdateUser(ctx, userID, bson.M{
 			"$inc": bson.M{"usageCount": 1},
 			"$set": bson.M{"lastUsed": time.Now().UnixMilli(), "lastDownload": time.Now().UnixMilli()},
 		})
