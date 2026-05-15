@@ -1,9 +1,10 @@
 # 📲 IPA Downloader Telegram Bot
 
-> **English:** [scroll down](#english)
-> **Tiếng Việt:** đọc bên dưới
+🇬🇧 **English** → [click here](#-english) · 🇻🇳 **Tiếng Việt** → đọc bên dưới ⬇️
 
 ---
+
+<a id="vi"></a>
 
 ## 🇻🇳 Tiếng Việt
 
@@ -215,7 +216,11 @@ go test ./...
 
 ---
 
-## 🇬🇧 English {#english}
+<a id="-english"></a>
+
+## 🇬🇧 English
+
+[⬆ Lên đầu / Back to top](#-ipa-downloader-telegram-bot)
 
 Telegram bot to download IPA files directly from the App Store to Telegram. Supports multiple Apple IDs, 2FA, and large files (≤ 2GB free / ≤ 4GB premium).
 
